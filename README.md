@@ -1,4 +1,6 @@
 labeled-graph
 =============
 
-Haskell Labeled Graph
+A library for labeled graphs, represented as array of adjacency lists.
+
+
