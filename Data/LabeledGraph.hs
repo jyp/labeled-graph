@@ -1,8 +1,9 @@
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ScopedTypeVariables, ParallelListComp, RankNTypes, TypeOperators #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Data.LabeledGraph
--- Copyright   :  (c) The University of Glasgow 2002, Jean-Philippe Bernardy 2012
+-- Copyright   :  (c) The University of Glasgow 2002,
+--                    Jean-Philippe Bernardy 2012-2016
 -- License     :  BSD-style
 --
 -- Maintainer  :  JP Bernardy
@@ -14,143 +15,81 @@
 --   /Structuring Depth-First Search Algorithms in Haskell/,
 --   by David King and John Launchbury.
 --
---   Adapted to labeled graphs by JP Bernardy.
+-- And
+--
+--   /Cycle therapy: a prescription for fold and unfold on regular trees/
+--   by Franklyn Turbak and J.B. Wells
+--
+--   Adaptation by JP Bernardy.
 --
 -----------------------------------------------------------------------------
 
-module Data.Graph{-(
+module Data.LabeledGraph(
 
         -- * External interface
 
         -- At present the only one with a "nice" external interface
-        stronglyConnComp, stronglyConnCompR, SCC(..), flattenSCC, flattenSCCs,
+        -- stronglyConnComp, stronglyConnCompR, SCC(..), flattenSCC, flattenSCCs,
 
         -- * Graphs
-
         Graph, Table, Bounds, Edge, Vertex,
 
         -- ** Building graphs
-
-        graphFromEdges, graphFromEdges', buildG, transposeG,
+        graphFromEdges, graphFromEdges', buildEdges, buildG, transposeG,
         -- reverseE,
 
         -- ** Graph properties
 
         vertices, edges,
         outdegree, indegree,
+        unlabel,
 
         -- * Algorithms
 
         dfs, dff,
         topSort,
         components,
-        scc,
-        bcc,
-        -- tree, back, cross, forward,
+        scc, bcc,
         reachable, path,
+
+        -- * Folding
+        fold', scan', scan,
+
+        -- * Unfolding
+        unfold, unfoldMany,
 
         module Data.LabeledTree
 
-    ) -} where
+    )  where
 
+import Control.Monad (ap)
 import Control.Monad.ST
 import Data.Array.ST (STArray, newArray, readArray, writeArray)
 import Data.LabeledTree (Tree(Node), Forest, (::>)((::>)) )
-
+import qualified Data.Graph as Unlabeled
+import Data.Graph as Data.LabeledGraph (Vertex,Table,Bounds)
 import Data.STRef
 
-import Control.DeepSeq (NFData(rnf))
+-- import Control.DeepSeq (NFData(rnf))
 import Data.Maybe
 import Data.Array
 import Data.List
 import qualified Data.Map as M
+import qualified Data.Set as S
 
 
--------------------------------------------------------------------------
---                                                                      -
---      External interface
---                                                                      -
--------------------------------------------------------------------------
-{-
--- | Strongly connected component.
-data SCC vertex = AcyclicSCC vertex     -- ^ A single vertex that is not
-                                        -- in any cycle.
-                | CyclicSCC  [vertex]   -- ^ A maximal set of mutually
-                                        -- reachable vertices.
+unlabel :: Graph e -> Unlabeled.Graph
+unlabel = fmap (fmap snd)
 
-instance NFData a => NFData (SCC a) where
-    rnf (AcyclicSCC v) = rnf v
-    rnf (CyclicSCC vs) = rnf vs
-
--- | The vertices of a list of strongly connected components.
-flattenSCCs :: [SCC a] -> [a]
-flattenSCCs = concatMap flattenSCC
-
--- | The vertices of a strongly connected component.
-flattenSCC :: SCC vertex -> [vertex]
-flattenSCC (AcyclicSCC v) = [v]
-flattenSCC (CyclicSCC vs) = vs
-
--- | The strongly connected components of a directed graph, topologically
--- sorted.
-stronglyConnComp
-        :: Ord key
-        => [(node, key, [key])]
-                -- ^ The graph: a list of nodes uniquely identified by keys,
-                -- with a list of keys of nodes this node has edges to.
-                -- The out-list may contain keys that don't correspond to
-                -- nodes of the graph; such edges are ignored.
-        -> [SCC node]
-
-stronglyConnComp edges0
-  = map get_node (stronglyConnCompR edges0)
-  where
-    get_node (AcyclicSCC (n, _, _)) = AcyclicSCC n
-    get_node (CyclicSCC triples)     = CyclicSCC [n | (n,_,_) <- triples]
-
--- | The strongly connected components of a directed graph, topologically
--- sorted.  The function is the same as 'stronglyConnComp', except that
--- all the information about each node retained.
--- This interface is used when you expect to apply 'SCC' to
--- (some of) the result of 'SCC', so you don't want to lose the
--- dependency information.
-stronglyConnCompR
-        :: Ord key
-        => [(node, key, [key])]
-                -- ^ The graph: a list of nodes uniquely identified by keys,
-                -- with a list of keys of nodes this node has edges to.
-                -- The out-list may contain keys that don't correspond to
-                -- nodes of the graph; such edges are ignored.
-        -> [SCC (node, key, [key])]     -- ^ Topologically sorted
-
-stronglyConnCompR [] = []  -- added to avoid creating empty array in graphFromEdges -- SOF
-stronglyConnCompR edges0
-  = map decode forest
-  where
-    (graph, vertex_fn,_) = graphFromEdges edges0
-    forest             = scc graph
-    decode (Node v []) | mentions_itself v = CyclicSCC [vertex_fn v]
-                       | otherwise         = AcyclicSCC (vertex_fn v)
-    decode other = CyclicSCC (dec other [])
-                 where
-                   dec (Node v ts) vs = vertex_fn v : foldr dec vs ts
-    mentions_itself v = v `elem` (graph ! v)
--}
--------------------------------------------------------------------------
+------------------------------------------------------------------------
 --                                                                      -
 --      Graphs
 --                                                                      -
 -------------------------------------------------------------------------
 
--- | Abstract representation of vertices.
-type Vertex  = Int
--- | Table indexed by a contiguous set of vertices.
-type Table a = Array Vertex a
 -- | Adjacency list representation of a graph, mapping each vertex to its
 -- list of successors.
 type Graph e  = Table [(e,Vertex)]
--- | The bounds of a 'Table'.
-type Bounds  = (Vertex, Vertex)
 -- | An edge from the first vertex to the second.
 type Edge e  = (Vertex,e,Vertex)
 
@@ -160,10 +99,16 @@ data ColouredGraph c e = ColouredGraph (Graph e) (Colouring c)
 type Colouring a = Vertex -> a
 
 
+showWithColor :: forall a a1 i.
+                   (Show a, Show a1, Show i, Ix i) =>
+                   Array i a1 -> (i -> a) -> [Char]
 showWithColor gr color = concat $ map showNode $ range $ bounds gr
-    where showNode n =  show n ++ ": " ++ show (color n) ++ " -> " ++ show (gr!n) ++ "\n"
+  where
+    showNode n = show n ++ ": " ++ show (color n) ++ " -> " ++ show (gr!n) ++ "\n"
 
-showDotFile gr = 
+-- debug
+showDotFile :: forall a. Show a => Graph a -> [Char]
+showDotFile gr =
     "digraph name {\n" ++
     "rankdir=LR;\n" ++
     (concatMap showEdge $ edges gr) ++
@@ -190,7 +135,18 @@ mapT f t = array (bounds t) [ (,) v (f v (t!v)) | v <- indices t ]
 
 -- | Build a graph from a list of edges.
 buildG :: Bounds -> [Edge e] -> Graph e
-buildG bounds0 edges0 = accumArray (flip (:)) [] bounds0 [(v, (l,w)) | (v,l,w) <- edges0]
+buildG bounds0 edges0 = accumArray (flip (:)) [] bounds0 [(v, (l,w))
+                                                         | (v,l,w) <- edges0]
+
+-- | Turn nodes to vertices in a list of edges. To be composed with BuildG
+buildEdges :: Ord nodeKey => [(nodeKey,edgeLabel,nodeKey)] ->
+              (Bounds,[Edge edgeLabel],Vertex -> nodeKey)
+buildEdges es = ((0,S.size keys - 1),map mkEdge es,flip S.elemAt keys)
+  where keys = S.fromList [x | (s,_,t) <- es, x <- [s,t]]
+        lkKey k = case S.lookupIndex k keys of
+          Just ix -> ix
+          Nothing -> error "LabeledGraph: unknown key"
+        mkEdge (s,e,t) = (lkKey s,e,lkKey t)
 
 -- | The graph obtained by reversing all edges.
 transposeG  :: Graph e -> Graph e
@@ -198,11 +154,6 @@ transposeG g = buildG (bounds g) (reverseE g)
 
 reverseE    :: Graph e -> [Edge e]
 reverseE g   = [ (w, l, v) | (v, l, w) <- edges g ]
-
--- | Reverse all the edges of a graph
-reverseG    :: Graph e -> Graph e
-reverseG g   = buildG (bounds g) (reverseE g)
-
 
 -- | A table of the count of edges from each node.
 outdegree :: Graph e -> Table Int
@@ -228,7 +179,7 @@ graphFromEdges' x = (a,b) where
 -- The out-list may contain keys that don't correspond to
 -- nodes of the graph; they are ignored.
 graphFromEdges
-        :: forall key e node. 
+        :: forall key e node.
            Ord key
         => [(node, key, [(e,key)])]
         -> (Graph e, Vertex -> (node, key, [(e,key)]), key -> Maybe Vertex)
@@ -241,7 +192,7 @@ graphFromEdges edges0
     edges1          = zipWith (,) [0..] sorted_edges
 
     graph :: Graph e
-    graph           = array bounds0 [(,) v [(e,v') | (e,k) <- ks, let Just v' = key_vertex k] 
+    graph           = array bounds0 [(,) v [(e,v') | (e,k) <- ks, let Just v' = key_vertex k]
                                     | (,) v (_,    _, ks) <- edges1]
     key_map         = array bounds0 [(,) v k                        | (,) v (_,    k, _ ) <- edges1]
     vertex_map      = array bounds0 edges1
@@ -260,7 +211,7 @@ graphFromEdges edges0
                                    GT -> findVertex (mid+1) b
                               where
                                 mid = (a + b) `div` 2
-                                
+
 -------------------------------------------------------------------------
 --                                                                      -
 --      Depth first search
@@ -278,6 +229,7 @@ dff g         = dfs g (vertices g)
 dfs          :: Graph e -> [Vertex] -> [Tree e Vertex]
 dfs g vs      = map dropLabel $ prune (bounds g) (map (\v -> error "dfs: no top-level label" ::> generate g v) vs)
 
+dropLabel :: forall t t1. t ::> t1 -> t1
 dropLabel ~(_ ::> t) = t
 
 
@@ -304,6 +256,13 @@ chop ((e ::> Node v ts) : us)
 -- Use the ST for constant-time primitives.
 
 newtype SetM s a = SetM { runSetM :: STArray s Vertex Bool -> ST s a }
+
+instance Functor (SetM s) where
+  fmap f = (pure f <*>)
+
+instance Applicative (SetM s) where
+  (<*>) = ap
+  pure = return
 
 instance Monad (SetM s) where
     return x     = SetM $ const (return x)
@@ -332,15 +291,13 @@ include v     = SetM $ \ m -> writeArray m v True
 type DList a = a -> a
 
 dconcat :: [DList a] -> DList a
-dconcat = foldr (.) id 
+dconcat = foldr (.) id
 
 preorder' :: [e] -> Tree e a -> DList [(a,[e])]
 preorder' es (Node a ts) = ((a,es) :) . preorderF' es ts
 
-preorderF' :: [e] -> Forest e a -> DList [(a,[e])] 
+preorderF' :: [e] -> Forest e a -> DList [(a,[e])]
 preorderF' es ts = dconcat [ preorder' (e : es) t | (e ::> t) <- ts]
-
-second f (a,b) = (a,f b)
 
 preorderF :: [Tree e a] -> [(a,[e])]
 preorderF ts = dconcat [ preorder' [] t | t <- ts] []
@@ -406,50 +363,47 @@ reachable g v = preorderF (dfs g [v])
 path         :: Graph e -> Vertex -> Vertex -> Bool
 path g v w    = w `elem` map fst (reachable g v)
 
-------------------------------------------------------------
+-----------------------------------------------------------------
 -- Algorithm 7: Biconnected components
 ------------------------------------------------------------
-{-
+
 -- | The biconnected components of a graph.
 -- An undirected graph is biconnected if the deletion of any vertex
 -- leaves it connected.
-bcc :: Graph -> Forest [Vertex]
+
+bcc :: Graph e -> Forest e [Vertex]
 bcc g = (concat . map bicomps . map (do_label g dnum)) forest
  where forest = dff g
        dnum   = preArr (bounds g) forest
 
 do_label :: Graph e -> Table Int -> Tree e Vertex -> Tree e (Vertex,Int,Int)
 do_label g dnum (Node v ts) = Node (v,dnum!v,lv) us
- where us = map (do_label g dnum) ts
-       lv = minimum ([dnum!v] ++ [dnum!w | w <- g!v]
-                     ++ [lu | Node (_,_,lu) _ <- us])
+ where us = map (fmap (do_label g dnum)) ts
+       lv = minimum ([dnum!v] ++ [dnum!w | (e,w) <- g!v]
+                     ++ [lu | _ ::> Node (_,_,lu) _ <- us])
 
-bicomps :: Tree (Vertex,Int,Int) -> Forest [Vertex]
+bicomps :: Tree e (Vertex,Int,Int) -> Forest e [Vertex]
 bicomps (Node (v,_,_) ts)
-      = [ Node (v:vs) us | (_,Node vs us) <- map collect ts]
+      = [ e ::> Node (v:vs) us | e ::> (_,Node vs us) <- map (fmap collect) ts]
 
 collect :: Tree e (Vertex,Int,Int) -> (Int, Tree e [Vertex])
 collect (Node (v,dv,lv) ts) = (lv, Node (v:vs) cs)
- where collected = map collect ts
-       vs = concat [ ws | (lw, Node ws _) <- collected, lw<dv]
-       cs = concat [ if lw<dv then us else [Node (v:ws) us]
-                        | (lw, Node ws us) <- collected ]
-            
-            
--}
--------------
+ where collected = map (fmap collect) ts
+       vs = concat [ ws | _ ::> (lw, Node ws _) <- collected, lw<dv]
+       cs = concat [ if lw<dv then us else [e ::> Node (v:ws) us]
+                        | e ::> (lw, Node ws us) <- collected ]
 -- * Cycamore stuff
 
-put ref item = 
+put :: forall s a. STRef s [a] -> a -> ST s ()
+put ref item =
  do l <- readSTRef ref
     writeSTRef ref (item:l)
 
-allocId uidRef = 
+allocId :: forall b s. Num b => STRef s b -> ST s b
+allocId uidRef =
     do uid <- readSTRef uidRef
        writeSTRef uidRef (uid + 1)
        return uid
-
-simpleGenerator f x = (x, f x)
 
 unfoldManyST :: forall key edgeLabel colour stTag. (Ord key) => (key -> (colour, [(edgeLabel, key)]))
              -> [key] -> ST stTag ([Vertex], ColouredGraph colour edgeLabel)
@@ -458,13 +412,13 @@ unfoldManyST gen seeds =
 	allNodes <- newSTRef []
         uidRef <- newSTRef firstId
 	let -- cyc :: a -> ST s Vertex
-            cyc src = 
+            cyc src =
 	     do probe <- memTabFind mtab src
 	        case probe of
   	         Just result -> return result
 	         Nothing -> do
 		     v <- allocId uidRef
-		     memTabBind src v mtab 
+		     memTabBind src v mtab
 		     let (lab, deps) = gen src
 		     ws <- mapM (cyc . snd) deps
 		     let res = (v, lab, [(fst d, w) | d <- deps | w <- ws])
@@ -481,7 +435,7 @@ unfoldManyST gen seeds =
          memTabFind mt key = return . M.lookup key =<< readSTRef mt
          memTabBind key val mt = modifySTRef mt (M.insert key val)
 
-unfold :: forall key edgeLabel colour stTag. (Ord key) => (key -> (colour, [(edgeLabel, key)]))
+unfold :: forall key edgeLabel colour. (Ord key) => (key -> (colour, [(edgeLabel, key)]))
              -> key -> (Vertex, ColouredGraph colour edgeLabel)
 unfold f r = (r', res)
   where ([r'], res) = unfoldMany f [r]
@@ -497,7 +451,7 @@ scan' :: Eq c => c -> (Vertex -> [(b,c)] -> c) -> Graph b -> Colouring c
 scan' bot f gr = (finalTbl !)
     where finalTbl = fixedPoint updateTbl initialTbl
 	  initialTbl = listArray bnds (replicate (rangeSize bnds) bot)
-			   
+
 	  fixedPoint f x = fp x
 	      where fp z = if z == z' then z else fp z'
 			where z' = f z
@@ -508,4 +462,3 @@ scan' bot f gr = (finalTbl !)
 scan :: Eq c => c -> (a -> [(e,c)] -> c) -> ColouredGraph a e -> ColouredGraph c e
 scan bot f (ColouredGraph gr a) = ColouredGraph gr (scan' bot f' gr)
     where f' v kids = f (a v) kids
-
