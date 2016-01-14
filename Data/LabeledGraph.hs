@@ -114,7 +114,7 @@ showDotFile gr =
     (concatMap showEdge $ edges gr) ++
     "}\n"
     where showEdge (from, t, to) = show from ++ " -> " ++ show to ++
-				   " [label = \"" ++ show t ++ "\"];\n"
+                                   " [label = \"" ++ show t ++ "\"];\n"
 
 
 instance (Show c, Show e) => Show (ColouredGraph c e) where
@@ -409,28 +409,28 @@ unfoldManyST :: forall key edgeLabel colour stTag. (Ord key) => (key -> (colour,
              -> [key] -> ST stTag ([Vertex], ColouredGraph colour edgeLabel)
 unfoldManyST gen seeds =
      do mtab <- newSTRef M.empty
-	allNodes <- newSTRef []
+        allNodes <- newSTRef []
         uidRef <- newSTRef firstId
-	let -- cyc :: a -> ST s Vertex
+        let -- cyc :: a -> ST s Vertex
             cyc src =
-	     do probe <- memTabFind mtab src
-	        case probe of
-  	         Just result -> return result
-	         Nothing -> do
-		     v <- allocId uidRef
-		     memTabBind src v mtab
-		     let (lab, deps) = gen src
-		     ws <- mapM (cyc . snd) deps
-		     let res = (v, lab, [(fst d, w) | d <- deps | w <- ws])
+             do probe <- memTabFind mtab src
+                case probe of
+                 Just result -> return result
+                 Nothing -> do
+                     v <- allocId uidRef
+                     memTabBind src v mtab
+                     let (lab, deps) = gen src
+                     ws <- mapM (cyc . snd) deps
+                     let res = (v, lab, [(fst d, w) | d <- deps | w <- ws])
                      put allNodes res
-		     return v
-	mapM_ cyc seeds
-	list <- readSTRef allNodes
-	seedsResult <- (return . map fromJust) =<< mapM (memTabFind mtab) seeds
-	lastId <- readSTRef uidRef
-	let cycamore = array (firstId, lastId-1) [(i, k) | (i, a, k) <- list]
-	let labels = array (firstId, lastId-1) [(i, a) | (i, a, k) <- list]
-	return (seedsResult, ColouredGraph cycamore (labels!))
+                     return v
+        mapM_ cyc seeds
+        list <- readSTRef allNodes
+        seedsResult <- (return . map fromJust) =<< mapM (memTabFind mtab) seeds
+        lastId <- readSTRef uidRef
+        let cycamore = array (firstId, lastId-1) [(i, k) | (i, a, k) <- list]
+        let labels = array (firstId, lastId-1) [(i, a) | (i, a, k) <- list]
+        return (seedsResult, ColouredGraph cycamore (labels!))
    where firstId = 0::Vertex
          memTabFind mt key = return . M.lookup key =<< readSTRef mt
          memTabBind key val mt = modifySTRef mt (M.insert key val)
@@ -450,13 +450,13 @@ fold' z f gr v = scan' z f gr v
 scan' :: Eq c => c -> (Vertex -> [(b,c)] -> c) -> Graph b -> Colouring c
 scan' bot f gr = (finalTbl !)
     where finalTbl = fixedPoint updateTbl initialTbl
-	  initialTbl = listArray bnds (replicate (rangeSize bnds) bot)
+          initialTbl = listArray bnds (replicate (rangeSize bnds) bot)
 
-	  fixedPoint f x = fp x
-	      where fp z = if z == z' then z else fp z'
-			where z' = f z
-	  updateTbl tbl = listArray bnds $ map recompute $ vertices gr
-	      where recompute v = f v [(b, tbl!k) | (b, k) <- gr!v]
+          fixedPoint f x = fp x
+              where fp z = if z == z' then z else fp z'
+                        where z' = f z
+          updateTbl tbl = listArray bnds $ map recompute $ vertices gr
+              where recompute v = f v [(b, tbl!k) | (b, k) <- gr!v]
           bnds = bounds gr
 
 scan :: Eq c => c -> (a -> [(e,c)] -> c) -> ColouredGraph a e -> ColouredGraph c e
