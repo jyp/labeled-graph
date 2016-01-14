@@ -10,8 +10,10 @@ description:
 build-type: Simple
 cabal-version:  >=1.6
 
-Library 
+Library
  build-depends: base >= 1 && < 6
  build-depends: labeled-tree >= 1 && < 1000
+ build-depends: containers
+ build-depends: array
  exposed-modules:
-  Data.LabeledGraph    
+  Data.LabeledGraph
